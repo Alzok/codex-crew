@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from mcp.utils import retry_call
+
 
 @dataclass
 class TaskRow:
@@ -65,34 +67,37 @@ class TaskStore:
         error: Optional[str] = None,
     ) -> None:
         now = time.time()
-        with self._lock, self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO tasks (task_id, objective, command, status, mode, created_at, updated_at, worker_pid, exit_code, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    objective=excluded.objective,
-                    command=excluded.command,
-                    status=excluded.status,
-                    mode=excluded.mode,
-                    updated_at=excluded.updated_at,
-                    worker_pid=excluded.worker_pid,
-                    exit_code=excluded.exit_code,
-                    error=excluded.error
-                """,
-                (
-                    task_id,
-                    objective,
-                    command,
-                    status,
-                    mode,
-                    now,
-                    now,
-                    worker_pid,
-                    exit_code,
-                    error,
-                ),
-            )
+        def _op() -> None:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO tasks (task_id, objective, command, status, mode, created_at, updated_at, worker_pid, exit_code, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        objective=excluded.objective,
+                        command=excluded.command,
+                        status=excluded.status,
+                        mode=excluded.mode,
+                        updated_at=excluded.updated_at,
+                        worker_pid=excluded.worker_pid,
+                        exit_code=excluded.exit_code,
+                        error=excluded.error
+                    """,
+                    (
+                        task_id,
+                        objective,
+                        command,
+                        status,
+                        mode,
+                        now,
+                        now,
+                        worker_pid,
+                        exit_code,
+                        error,
+                    ),
+                )
+
+        retry_call(_op, attempts=3, delay=0.2, exceptions=(sqlite3.OperationalError,))
 
     def update_fields(self, task_id: str, **fields) -> None:
         if not fields:
@@ -101,11 +106,14 @@ class TaskStore:
         assignments = ", ".join(f"{key} = ?" for key in fields)
         values = list(fields.values())
         values.append(task_id)
-        with self._lock, self._connection:
-            self._connection.execute(
-                f"UPDATE tasks SET {assignments} WHERE task_id = ?",
-                values,
-            )
+        def _op() -> None:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    f"UPDATE tasks SET {assignments} WHERE task_id = ?",
+                    values,
+                )
+
+        retry_call(_op, attempts=3, delay=0.2, exceptions=(sqlite3.OperationalError,))
 
     def get(self, task_id: str) -> Optional[TaskRow]:
         cursor = self._connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
@@ -117,4 +125,3 @@ class TaskStore:
     def list(self) -> List[TaskRow]:
         cursor = self._connection.execute("SELECT * FROM tasks ORDER BY created_at DESC")
         return [TaskRow(**row) for row in cursor.fetchall()]
-

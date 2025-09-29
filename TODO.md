@@ -9,3 +9,16 @@
 - [x] Journaliser dans `events.ndjson` les claims, arbitrages et diff finaux.
 - [x] Ajouter un mode Docker (Dockerfile + docs) pour exécuter Numerus dans un container.
 - [x] Étendre la documentation (prompts types, format JSON attendu, exemples d'utilisation).
+- [x] Introduire un EventBus interne pour Numerus (gestion des abonnements, métriques, diffusion plan/claim/exec).
+- [x] Implémenter un TerminalPool avec sessions réutilisables et adaptateurs "native"/"interactive".
+- [x] Structurer une Memory Manager (banque par tâche, cache, backend SQLite) pour historiser les exchanges Codex.
+- [x] Ajouter des mécanismes de résilience (retry/circuit breaker) sur la création de sessions Codex et la persistance des jobs.
+- [x] Définir une couche "roles" inspirée HiveMind (planner/queen/executor/reviewer) et ajuster planification.
+- [ ] Intégrer un "quality judge" automatique (analyse diff/tests) inspiré de `ccswarm` pour valider les livrables avant succès.
+- [ ] Proposer une interface de monitoring (TUI ou dashboard web léger) montrant statut/événements, à la manière de `ccswarm`/`claude-flow`.
+- [ ] Implémenter un système de hooks/automation (pré/post tâches) pour enchaîner actions personnalisées comme dans `claude-flow`.
+- [ ] Ajouter un moteur de re-planification heuristique (multi stratégies, fallback) inspiré d'AutoGen.
+- [ ] Étendre `MEMORY_MANAGER` avec recherche vectorielle / similarité pour retrouver contextes pertinents (Autogen/Claude-Flow).
+- [ ] Supporter `codex exec resume` ou reprise de tâches interrompues.
+- [ ] Ajouter un circuit d'approbation interactif (UI/CLI) pour les opérations sensibles, au-delà du simple GO/NO GO automatique.
+- [ ] Construire une suite de benchmarks/tests de performance inspirée des scripts `claude-flow`.

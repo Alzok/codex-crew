@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from mcp.store import TaskStore
+from mcp.memory import MEMORY_MANAGER
 from mcp.orchestrator.job_runner import JobRunner
 from mcp.terminal.manager import TerminalManager
 
@@ -42,12 +43,19 @@ def main(task_id: str) -> int:
 
     try:
         store.update_fields(task_id, status="running")
+        memory_bank_id = MEMORY_MANAGER.ensure_bank(f"job-{task_id}")
+        MEMORY_MANAGER.store(
+            bank_id=memory_bank_id,
+            entry_type="objective",
+            data={"objective": row.objective},
+        )
         runner = JobRunner(
             job_id=task_id,
             objective=row.objective,
             job_dir=job_dir,
             manager=manager,
             store=store,
+            memory_bank_id=memory_bank_id,
         )
         runner.run()
         store.update_fields(task_id, status="succeeded", exit_code=0, error=None)

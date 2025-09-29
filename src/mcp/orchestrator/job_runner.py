@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from mcp.event_bus import EVENT_BUS
+from mcp.memory import MEMORY_MANAGER
 from mcp.orchestrator.planner import Plan, PlanTask
 from mcp.store import TaskStore
 from mcp.terminal.manager import TaskRecord, TerminalManager
@@ -77,6 +79,7 @@ class JobRunner:
         store: TaskStore,
         analysis_timeout: Optional[float] = 120.0,
         execution_timeout: Optional[float] = 600.0,
+        memory_bank_id: Optional[str] = None,
     ) -> None:
         self.job_id = job_id
         self.objective = objective
@@ -90,6 +93,8 @@ class JobRunner:
         self.completed: set[str] = set()
         self.locks = ResourceLocks()
         self.blocked: set[str] = set()
+        self.memory_bank_id = memory_bank_id or MEMORY_MANAGER.ensure_bank(f"job-{job_id}")
+        self._record_plan()
 
     def run(self) -> None:
         remaining: Dict[str, PlanTask] = {task.task_id: task for task in self.plan.tasks}
@@ -106,11 +111,11 @@ class JobRunner:
                     claim = self._analyze_task(task)
                     self.claims[task_id] = claim
                     self._persist_claim(claim)
-                    self._log_job_event(
-                        "claim_recorded",
-                        {
-                            "task_id": task_id,
-                            "resources": {
+        self._log_job_event(
+            "claim_recorded",
+            {
+                "task_id": task_id,
+                "resources": {
                                 "reads": claim.reads,
                                 "writes": claim.writes,
                             },
@@ -119,11 +124,11 @@ class JobRunner:
                     )
                 if not self.locks.can_lock(task_id, claim.writes):
                     if task_id not in self.blocked:
-                        self.blocked.add(task_id)
-                        self.store.update_fields(self.job_id, status=f"blocked:{task_id}")
-                        self._log_job_event(
-                            "claim_blocked",
-                            {
+                self.blocked.add(task_id)
+                self.store.update_fields(self.job_id, status=f"blocked:{task_id}")
+                self._log_job_event(
+                    "claim_blocked",
+                    {
                                 "task_id": task_id,
                                 "waiting_for": claim.writes,
                             },
@@ -228,6 +233,18 @@ class JobRunner:
     def _persist_claim(self, claim: ClaimResult) -> None:
         claim_path = self.job_dir / f"{claim.task_id}_claim.json"
         claim_path.write_text(json.dumps(claim.raw, indent=2, ensure_ascii=False), encoding="utf-8")
+        MEMORY_MANAGER.store(
+            bank_id=self.memory_bank_id,
+            entry_type="claim",
+            data={
+                "task_id": claim.task_id,
+                "resources": {
+                    "reads": claim.reads,
+                    "writes": claim.writes,
+                },
+                "commands": claim.commands,
+            },
+        )
 
     def _wait(self, record: TaskRecord) -> None:
         while record.status == "running":
@@ -287,3 +304,25 @@ class JobRunner:
         with path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(event, ensure_ascii=False))
             fp.write("\n")
+        EVENT_BUS.emit(
+            f"job.{event_type}",
+            {
+                "job_id": self.job_id,
+                **payload,
+            },
+        )
+        MEMORY_MANAGER.store(
+            bank_id=self.memory_bank_id,
+            entry_type=event_type,
+            data={"job_id": self.job_id, **payload},
+        )
+
+    def _record_plan(self) -> None:
+        MEMORY_MANAGER.store(
+            bank_id=self.memory_bank_id,
+            entry_type="plan",
+            data={
+                "objective": self.objective,
+                "tasks": [task.to_dict() for task in self.plan.tasks],
+            },
+        )

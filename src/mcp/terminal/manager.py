@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Optional
+
+from mcp.event_bus import EVENT_BUS
+from mcp.terminal.pool import TerminalPool
+from mcp.terminal.session import TerminalSession
+from mcp.utils import CircuitBreaker, CircuitBreakerOpen, retry_call
 
 
 @dataclass
@@ -32,16 +37,17 @@ class TaskRecord:
 
 
 class TerminalManager:
-    """Manage Codex CLI executions inside dedicated PTYs."""
+    """Manage Codex CLI executions inside reusable PTY sessions."""
 
-    def __init__(self, runs_dir: Path | str = "runs", codex_bin: str = "codex") -> None:
+    def __init__(self, runs_dir: Path | str = "runs", codex_bin: str = "codex", pool_size: int = 4) -> None:
         self._runs_dir = Path(runs_dir)
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._codex_bin = codex_bin
         self._tasks: Dict[str, TaskRecord] = {}
-        self._processes: Dict[str, subprocess.Popen[str]] = {}
-        self._masters: Dict[str, int] = {}
+        self._processes: Dict[str, TerminalSession] = {}
         self._lock = threading.Lock()
+        self._pool = TerminalPool(size=pool_size)
+        self._spawn_breaker = CircuitBreaker("terminal_spawn", threshold=3, cooldown=30.0)
 
     def create(
         self,
@@ -77,82 +83,103 @@ class TerminalManager:
         if env:
             env_vars.update(env)
 
-        spawn_command = [self._codex_bin, "exec", command]
-
-        master_fd, slave_fd = os.openpty()
-        process = subprocess.Popen(
-            spawn_command,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            cwd=str(workdir),
-            env=env_vars,
-            text=True,
-            close_fds=True,
-        )
-        os.close(slave_fd)
+        session = self._checkout_session(workdir, env_vars, timeout)
+        try:
+            self._spawn_breaker.allow()
+            process = retry_call(
+                lambda: session.spawn_exec(command),
+                attempts=3,
+                delay=0.5,
+            )
+        except CircuitBreakerOpen as exc:
+            self._pool.release(session)
+            raise RuntimeError("Terminal spawn temporairement indisponible") from exc
+        except Exception:
+            self._spawn_breaker.record_failure()
+            session.close()
+            self._pool.remove(session.session_id)
+            raise
+        else:
+            self._spawn_breaker.record_success()
 
         with self._lock:
             self._tasks[task_id] = task
-            self._processes[task_id] = process
-            self._masters[task_id] = master_fd
+            self._processes[task_id] = session
 
-        self._write_event(events_path, "started", {"pid": process.pid, "command": spawn_command, "metadata": task.metadata})
+        self._write_event(
+            events_path,
+            "started",
+            {
+                "pid": process.pid,
+                "session_id": session.session_id,
+                "command": [self._codex_bin, "exec", command],
+                "metadata": task.metadata,
+            },
+        )
 
         watcher = threading.Thread(
             target=self._watch_process,
-            args=(task, process, master_fd, stdout_path, events_path, timeout),
+            args=(task, session, process, stdout_path, events_path, timeout),
             daemon=True,
         )
         watcher.start()
 
         return task
 
+    def _checkout_session(
+        self,
+        workdir: Path,
+        env: Dict[str, str],
+        timeout: Optional[float],
+    ) -> TerminalSession:
+        try:
+            session = self._pool.acquire(block=False)
+        except TimeoutError:
+            session = TerminalSession(
+                session_id=f"session-{uuid.uuid4().hex[:8]}",
+                codex_bin=self._codex_bin,
+                workdir=workdir,
+                env=env,
+                timeout=timeout,
+            )
+            session.open()
+            self._pool.add(session)
+            session = self._pool.acquire(block=False)
+        session.configure(codex_bin=self._codex_bin, workdir=workdir, env=env, timeout=timeout)
+        return session
+
     def _watch_process(
         self,
         task: TaskRecord,
+        session: TerminalSession,
         process: subprocess.Popen[str],
-        master_fd: int,
         stdout_path: Path,
         events_path: Path,
         timeout: Optional[float],
     ) -> None:
         deadline = time.time() + timeout if timeout else None
         timed_out = False
-        selector = selectors.DefaultSelector()
-        selector.register(master_fd, selectors.EVENT_READ)
 
-        try:
-            with stdout_path.open("a", encoding="utf-8") as stdout_file:
-                while True:
-                    if deadline and time.time() > deadline:
-                        timed_out = True
+        with stdout_path.open("a", encoding="utf-8") as stdout_file:
+            while True:
+                if deadline and time.time() > deadline:
+                    timed_out = True
+                    if process.poll() is None:
                         process.terminate()
-                        self._write_event(events_path, "timeout", {"timeout": timeout})
-                        break
-
-                    ready = selector.select(timeout=0.2)
-                    if ready:
-                        for _key, _mask in ready:
-                            try:
-                                data = os.read(master_fd, 4096)
-                            except OSError:
-                                ready = None
-                                break
-                            if not data:
-                                ready = None
-                                break
-                            text = data.decode("utf-8", errors="replace")
-                            stdout_file.write(text)
-                            stdout_file.flush()
-                            self._write_event(events_path, "stdout", {"data": text})
-                    if process.poll() is not None:
-                        break
-        finally:
-            selector.unregister(master_fd)
-            os.close(master_fd)
+                    self._write_event(events_path, "timeout", {"timeout": timeout})
+                    break
+                chunk = session.read(timeout=0.2)
+                if chunk:
+                    stdout_file.write(chunk)
+                    stdout_file.flush()
+                    self._write_event(events_path, "stdout", {"data": chunk})
+                if process.poll() is not None and not chunk:
+                    break
 
         exit_status = process.wait()
+        session.close()
+        self._pool.release(session)
+
         task.exit_code = exit_status
         task.end_time = time.time()
 
@@ -172,7 +199,7 @@ class TerminalManager:
 
         with self._lock:
             self._processes.pop(task.task_id, None)
-            self._masters.pop(task.task_id, None)
+            self._tasks[task.task_id] = task
 
     def _write_event(self, path: Path, event_type: str, payload: Dict[str, object]) -> None:
         event = {
@@ -184,6 +211,13 @@ class TerminalManager:
         with path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(event, ensure_ascii=False))
             fp.write("\n")
+        EVENT_BUS.emit(
+            f"terminal.{event_type}",
+            {
+                "task_path": str(path.parent),
+                **payload,
+            },
+        )
 
     def logs(self, task_id: str) -> Iterable[str]:
         task = self._tasks.get(task_id)
@@ -197,11 +231,13 @@ class TerminalManager:
 
     def kill(self, task_id: str) -> None:
         with self._lock:
-            process = self._processes.get(task_id)
+            session = self._processes.get(task_id)
             task = self._tasks.get(task_id)
-        if not process or not task:
+        if not session or not task or not session.process:
             return
-        process.terminate()
+        session.process.terminate()
+        session.close()
+        self._pool.remove(session.session_id)
         task.status = "failed"
         task.error = "killed"
         task.end_time = time.time()
@@ -223,26 +259,23 @@ class TerminalManager:
             if not task:
                 raise KeyError(f"Unknown task {task_id}")
             task.metadata.update(fields)
-            self._write_event(
-                task.workdir / "events.ndjson",
-                "metadata",
-                {"updates": fields},
-            )
+        self._write_event(
+            task.workdir / "events.ndjson",
+            "metadata",
+            {"updates": fields},
+        )
 
     def attach(self, task_id: str):
-        """Return a file-like object bound to the PTY master for interactive usage."""
-
         with self._lock:
-            master_fd = self._masters.get(task_id)
-            process = self._processes.get(task_id)
-        if master_fd is None or process is None:
+            session = self._processes.get(task_id)
+        if not session:
             raise KeyError(f"Task {task_id} not attachable")
-        dup_fd = os.dup(master_fd)
+        dup_fd = os.dup(session.master_fd)
         return os.fdopen(dup_fd, "r+", encoding="utf-8", buffering=1)
 
     def send(self, task_id: str, data: str) -> None:
         with self._lock:
-            master_fd = self._masters.get(task_id)
-        if master_fd is None:
+            session = self._processes.get(task_id)
+        if not session:
             raise KeyError(f"Unknown task {task_id}")
-        os.write(master_fd, data.encode("utf-8"))
+        session.write(data)

@@ -10,7 +10,9 @@ import uuid
 from pathlib import Path
 from typing import List
 
+from mcp.event_bus import EVENT_BUS
 from mcp.orchestrator.planner import CodexPlanner, PlanError
+from mcp.orchestrator.roles import RolePlanner
 from mcp.store import TaskStore
 from mcp.terminal.manager import TerminalManager
 
@@ -42,11 +44,26 @@ def _launch_task(objective: str, max_parallel: int | None) -> int:
         print(f"Échec de la planification : {exc}", file=sys.stderr)
         return 1
 
+    role_planner = RolePlanner(planner_manager)
+    assignments = role_planner.assign(plan, job_id=task_id)
+    for task in plan.tasks:
+        if task.task_id in assignments:
+            task.role = assignments[task.task_id].role
+
     plan_path = job_dir / "plan.json"
     plan_path.write_text(plan.to_json(), encoding="utf-8")
     print(f"Plan ({len(plan.tasks)} tâche(s)) → {plan_path}")
     for task in plan.tasks:
-        print(f"  - {task.task_id}: {task.summary}")
+        print(f"  - {task.task_id} [{task.role}]: {task.summary}")
+    EVENT_BUS.emit(
+        "job.plan_created",
+        {
+            "job_id": task_id,
+            "objective": objective,
+            "plan_path": str(plan_path),
+            "tasks": [task.to_dict() for task in plan.tasks],
+        },
+    )
 
     store.upsert_task(
         task_id=task_id,
@@ -64,6 +81,15 @@ def _launch_task(objective: str, max_parallel: int | None) -> int:
     process = subprocess.Popen(worker_cmd, env=env, start_new_session=True)
     store.update_fields(task_id, worker_pid=process.pid, status="running")
     print(f"task {task_id} started")
+    EVENT_BUS.emit(
+        "job.started",
+        {
+            "job_id": task_id,
+            "objective": objective,
+            "plan_path": str(plan_path),
+            "worker_pid": process.pid,
+        },
+    )
     return 0
 
 

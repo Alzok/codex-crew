@@ -22,6 +22,7 @@ class PlanTask:
     dependencies: List[str] = field(default_factory=list)
     reads: List[str] = field(default_factory=list)
     writes: List[str] = field(default_factory=list)
+    role: str = "executor"
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -33,6 +34,7 @@ class PlanTask:
                 "reads": self.reads,
                 "writes": self.writes,
             },
+            "role": self.role,
         }
 
     @classmethod
@@ -44,6 +46,7 @@ class PlanTask:
         resources = payload.get("resources") if isinstance(payload.get("resources"), dict) else {}
         reads = cls._ensure_str_list(resources.get("reads") if isinstance(resources, dict) else [])
         writes = cls._ensure_str_list(resources.get("writes") if isinstance(resources, dict) else [])
+        role = str(payload.get("role") or payload.get("agent") or "executor")
         if not summary:
             summary = "No summary provided"
         return cls(
@@ -53,6 +56,7 @@ class PlanTask:
             dependencies=dependencies,
             reads=reads,
             writes=writes,
+            role=role,
         )
 
     @staticmethod
