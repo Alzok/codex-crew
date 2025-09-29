@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-orchestrator"
+version = "0.1.0"
+description = "Multi-agent Codex CLI orchestrator"
+authors = [{name = "Mathieu"}]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+numerus = "numerus.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = [
+    "mcp",
+    "mcp.cli",
+    "mcp.terminal",
+    "mcp.orchestrator",
+    "mcp.agents",
+    "mcp.store",
+    "numerus",
+]
